@@ -49,7 +49,7 @@ def create_cert_request(p_key, digest="sha256", **subject_kwargs):
     req = crypto.X509Req()
     subj = req.get_subject()
 
-    for key, value in subject_kwargs.items():
+    for key, value in list(subject_kwargs.items()):
         setattr(subj, key, value)
 
     req.set_pubkey(p_key)
@@ -120,7 +120,7 @@ def create_certificate(
 
 def ca_files_exist():
     return all(
-        [map(isfile, [ca_key, ca_crt, cert_key]), isdir(dir_name)])
+        [list(map(isfile, [ca_key, ca_crt, cert_key])), isdir(dir_name)])
 
 if not ca_files_exist():
     # TODO: move this code to pyopenssl library
@@ -144,7 +144,7 @@ if not ca_files_exist():
         if not isdir(cert_dir):
             mkdir(cert_dir)
 
-    except StandardError as e:
+    except Exception as e:
         print(e)
 
 
@@ -189,6 +189,6 @@ if __name__ == '__main__':
     )
 
 
-    print(crypto.dump_certificate(crypto.FILETYPE_PEM, signed_req))
+    print((crypto.dump_certificate(crypto.FILETYPE_PEM, signed_req)))
     'openssl x509 -req -days 3650 -CA ca.crt -CAkey ca.key -set_serial 1509982490957715'
     'https://github.com/pyca/pyopenssl/blob/master/examples/certgen.py'

@@ -4,8 +4,8 @@ import os
 import socket
 import ssl
 import select
-import httplib
-import urlparse
+import http.client
+import urllib.parse
 import threading
 import gzip
 import zlib
@@ -15,11 +15,12 @@ import re
 from ssl_wrapper import *
 from string import Template
 from OpenSSL import crypto
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
-from SocketServer import ThreadingMixIn
-from cStringIO import StringIO
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from io import StringIO, BytesIO
 from subprocess import Popen, PIPE
-from HTMLParser import HTMLParser
+from html.parser import HTMLParser
+import brotli
 
 
 def with_color(c, s):
@@ -44,15 +45,17 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 class ProxyRequestHandler(BaseHTTPRequestHandler):
     cakey = join_with_script_dir('ca.key')
-    cacert = join_with_script_dir('ca.crt')
-    certkey = join_with_script_dir('cert.key')
-    certdir = join_with_script_dir('certs/')
+    cacert = join_with_script_dir('./ssl-data/ca.crt')
+    certkey = join_with_script_dir('./ssl-data/cert.key')
+    certdir = join_with_script_dir('./ssl-data/certs/')
     timeout = 5
     lock = threading.Lock()
 
     def __init__(self, *args, **kwargs):
         self.tls = threading.local()
         self.tls.conns = {}
+
+        self._headers_buffer = []
 
         BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
@@ -94,7 +97,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 with open(certpath, 'wb+') as f:
                     f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
 
-        self.wfile.write("%s %d %s\r\n" % (self.protocol_version, 200, 'Connection Established'))
+        self.wfile.write(f"{str(self.protocol_version)} {200} {'Connection Established'}\r\n".encode())
         self.end_headers()
 
         self.connection = ssl.wrap_socket(self.connection,
@@ -159,7 +162,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             req_body = req_body_modified
             req.headers['Content-length'] = str(len(req_body))
 
-        u = urlparse.urlsplit(req.path)
+        u = urllib.parse.urlsplit(req.path)
         scheme, netloc, path = u.scheme, u.netloc, (u.path + '?' + u.query if u.query else u.path)
         assert scheme in ('http', 'https')
         if netloc:
@@ -170,9 +173,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             origin = (scheme, netloc)
             if not origin in self.tls.conns:
                 if scheme == 'https':
-                    self.tls.conns[origin] = httplib.HTTPSConnection(netloc, timeout=self.timeout)
+                    self.tls.conns[origin] = http.client.HTTPSConnection(netloc, timeout=self.timeout)
                 else:
-                    self.tls.conns[origin] = httplib.HTTPConnection(netloc, timeout=self.timeout)
+                    self.tls.conns[origin] = http.client.HTTPConnection(netloc, timeout=self.timeout)
             conn = self.tls.conns[origin]
             conn.request(self.command, path, req_body, dict(req.headers))
             res = conn.getresponse()
@@ -211,9 +214,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         setattr(res, 'headers', self.filter_headers(res.headers))
 
-        self.wfile.write("%s %d %s\r\n" % (self.protocol_version, res.status, res.reason))
-        for line in res.headers.headers:
-            self.wfile.write(line)
+        self.wfile.write(f"{str(self.protocol_version)} {res.status} {res.reason}\r\n".encode())
+        for line in res.headers:
+            self.wfile.write(line.encode())
         self.end_headers()
         self.wfile.write(res_body)
         self.wfile.flush()
@@ -222,16 +225,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.save_handler(req, req_body, res, res_body_plain)
 
     def relay_streaming(self, res):
-        self.wfile.write("%s %d %s\r\n" % (self.protocol_version, res.status, res.reason))
+        self.wfile.write(f"{str(self.protocol_version)} {res.status} {str(res.reason)}\r\n".encode())
         for line in res.headers.headers:
-            self.wfile.write(line)
+            self.wfile.write(line.encode())
         self.end_headers()
         try:
             while True:
                 chunk = res.read(8192)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                self.wfile.write(chunk.encode())
             self.wfile.flush()
         except socket.error:
             # connection closed by client
@@ -252,7 +255,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         # accept only supported encodings
         if 'Accept-Encoding' in headers:
             ae = headers['Accept-Encoding']
-            filtered_encodings = [x for x in re.split(r',\s*', ae) if x in ('identity', 'gzip', 'x-gzip', 'deflate')]
+            filtered_encodings = [x for x in re.split(r',\s*', ae) if x in ('identity', 'gzip', 'x-gzip', 'deflate', 'br')]
             headers['Accept-Encoding'] = ', '.join(filtered_encodings)
 
         return headers
@@ -275,7 +278,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if encoding == 'identity':
             text = data
         elif encoding in ('gzip', 'x-gzip'):
-            io = StringIO(data)
+            io = BytesIO(data)
             with gzip.GzipFile(fileobj=io) as f:
                 text = f.read()
         elif encoding == 'deflate':
@@ -283,6 +286,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 text = zlib.decompress(data)
             except zlib.error:
                 text = zlib.decompress(data, -zlib.MAX_WBITS)
+        
+        elif encoding == 'br':
+            try:
+                text = brotli.decompress(data)
+            except:
+                print("Oopsss....")
         else:
             raise Exception("Unknown Content-Encoding: %s" % encoding)
         return text
@@ -291,36 +300,36 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         with open(self.cacert, 'rb') as f:
             data = f.read()
 
-        self.wfile.write("%s %d %s\r\n" % (self.protocol_version, 200, 'OK'))
+        self.wfile.write(f"{str(self.protocol_version)} {200} {'OK'}\r\n".encode())
         self.send_header('Content-Type', 'application/x-x509-ca-cert')
         self.send_header('Content-Length', len(data))
         self.send_header('Connection', 'close')
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(data.encode())
 
     def print_info(self, req, req_body, res, res_body):
         def parse_qsl(s):
-            return '\n'.join("%-20s %s" % (k, v) for k, v in urlparse.parse_qsl(s, keep_blank_values=True))
+            return '\n'.join("%-20s %s" % (k, v) for k, v in urllib.parse.parse_qsl(s, keep_blank_values=True))
 
         req_header_text = "%s %s %s\n%s" % (req.command, req.path, req.request_version, req.headers)
         res_header_text = "%s %d %s\n%s" % (res.response_version, res.status, res.reason, res.headers)
 
-        print with_color(33, req_header_text)
+        print(with_color(33, req_header_text))
 
-        u = urlparse.urlsplit(req.path)
+        u = urllib.parse.urlsplit(req.path)
         if u.query:
             query_text = parse_qsl(u.query)
-            print with_color(32, "==== QUERY PARAMETERS ====\n%s\n" % query_text)
+            print(with_color(32, "==== QUERY PARAMETERS ====\n%s\n" % query_text))
 
         cookie = req.headers.get('Cookie', '')
         if cookie:
             cookie = parse_qsl(re.sub(r';\s*', '&', cookie))
-            print with_color(32, "==== COOKIE ====\n%s\n" % cookie)
+            print(with_color(32, "==== COOKIE ====\n%s\n" % cookie))
 
         auth = req.headers.get('Authorization', '')
         if auth.lower().startswith('basic'):
             token = auth.split()[1].decode('base64')
-            print with_color(31, "==== BASIC AUTH ====\n%s\n" % token)
+            print(with_color(31, "==== BASIC AUTH ====\n%s\n" % token))
 
         if req_body is not None:
             req_body_text = None
@@ -343,14 +352,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 req_body_text = req_body
 
             if req_body_text:
-                print with_color(32, "==== REQUEST BODY ====\n%s\n" % req_body_text)
+                print(with_color(32, "==== REQUEST BODY ====\n%s\n" % req_body_text))
 
-        print with_color(36, res_header_text)
+        print(with_color(36, res_header_text))
 
-        cookies = res.headers.getheaders('Set-Cookie')
+        cookies = res.headers.get('Set-Cookie')
         if cookies:
             cookies = '\n'.join(cookies)
-            print with_color(31, "==== SET-COOKIE ====\n%s\n" % cookies)
+            print(with_color(31, "==== SET-COOKIE ====\n%s\n" % cookies))
 
         if res_body is not None:
             res_body_text = None
@@ -368,15 +377,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     res_body_text = res_body
             elif content_type.startswith('text/html'):
-                m = re.search(r'<title[^>]*>\s*([^<]+?)\s*</title>', res_body, re.I)
+                m = re.search(r'<title[^>]*>\s*([^<]+?)\s*</title>', res_body.decode('utf-8'), re.I)
                 if m:
                     h = HTMLParser()
-                    print with_color(32, "==== HTML TITLE ====\n%s\n" % h.unescape(m.group(1).decode('utf-8')))
+                    print(with_color(32, "==== HTML TITLE ====\n%s\n" % h.unescape(m.group(1))))
             elif content_type.startswith('text/') and len(res_body) < 1024:
                 res_body_text = res_body
 
             if res_body_text:
-                print with_color(32, "==== RESPONSE BODY ====\n%s\n" % res_body_text)
+                print(with_color(32, "==== RESPONSE BODY ====\n%s\n" % res_body_text))
 
     def request_handler(self, req, req_body):
         pass
@@ -399,7 +408,7 @@ def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer, prot
     httpd = ServerClass(server_address, HandlerClass)
 
     sa = httpd.socket.getsockname()
-    print "Serving HTTP Proxy on", sa[0], "port", sa[1], "..."
+    print("Serving HTTP Proxy on", sa[0], "port", sa[1], "...")
     httpd.serve_forever()
 
 
